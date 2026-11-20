@@ -48,11 +48,15 @@ func resetsBefore(aReset time.Time, aKnown bool, aID string, bReset time.Time, b
 	return aID < bID
 }
 
+// codexLongWindowMinMinutes is the shortest Codex window that counts as the
+// long window; 5-hour windows must never rank as the weekly window.
+const codexLongWindowMinMinutes = 24 * 60
+
 // longWindowResetAt returns when the auth's long quota window resets, taken from
 // the newest observed quota snapshot. It reports false when no future reset time
 // is known.
 func longWindowResetAt(auth *Auth, now time.Time) (time.Time, bool) {
-	signals := newestQuotaSignals(auth)
+	signals, observedAt := newestQuotaSignals(auth)
 	if len(signals) == 0 {
 		return time.Time{}, false
 	}
@@ -61,7 +65,7 @@ func longWindowResetAt(auth *Auth, now time.Time) (time.Time, bool) {
 	// describe the 5-hour window.
 	reset, ok := parseResetUnix(quotaSignal(signals, "Anthropic-Ratelimit-Unified-7d-Reset"))
 	if !ok {
-		reset, ok = codexLongWindowResetAt(signals)
+		reset, ok = codexLongWindowResetAt(signals, observedAt)
 	}
 	if !ok || !reset.After(now) {
 		return time.Time{}, false
@@ -69,25 +73,39 @@ func longWindowResetAt(auth *Auth, now time.Time) (time.Time, bool) {
 	return reset, true
 }
 
-// codexLongWindowResetAt uses the reset of the Codex slot with the larger
-// positive window length; that slot's reset is unknown when missing, with no
-// fallback to the shorter window. Without window lengths it uses the primary
-// reset.
-func codexLongWindowResetAt(signals map[string]string) (time.Time, bool) {
-	primaryMinutes, _ := strconv.ParseInt(quotaSignal(signals, "X-Codex-Primary-Window-Minutes"), 10, 64)
-	secondaryMinutes, _ := strconv.ParseInt(quotaSignal(signals, "X-Codex-Secondary-Window-Minutes"), 10, 64)
-	if secondaryMinutes > 0 && secondaryMinutes > primaryMinutes {
-		return parseResetUnix(quotaSignal(signals, "X-Codex-Secondary-Reset-At"))
+// codexLongWindowResetAt returns the reset of the Codex slot with the larger
+// window of at least codexLongWindowMinMinutes (primary on a tie). The reset is
+// unknown when no slot qualifies, with no fallback to the shorter window. The
+// slot's Reset-At wins; otherwise Reset-After-Seconds counts from observedAt.
+func codexLongWindowResetAt(signals map[string]string, observedAt time.Time) (time.Time, bool) {
+	slot := ""
+	var slotMinutes int64
+	for _, name := range []string{"Primary", "Secondary"} {
+		minutes, err := strconv.ParseInt(quotaSignal(signals, "X-Codex-"+name+"-Window-Minutes"), 10, 64)
+		if err == nil && minutes >= codexLongWindowMinMinutes && minutes > slotMinutes {
+			slot, slotMinutes = name, minutes
+		}
 	}
-	return parseResetUnix(quotaSignal(signals, "X-Codex-Primary-Reset-At"))
+	if slot == "" {
+		return time.Time{}, false
+	}
+	if reset, ok := parseResetUnix(quotaSignal(signals, "X-Codex-"+slot+"-Reset-At")); ok {
+		return reset, true
+	}
+	seconds, err := strconv.ParseInt(quotaSignal(signals, "X-Codex-"+slot+"-Reset-After-Seconds"), 10, 64)
+	if err != nil || seconds < 0 || observedAt.IsZero() {
+		return time.Time{}, false
+	}
+	return observedAt.Add(time.Duration(seconds) * time.Second), true
 }
 
 // newestQuotaSignals returns the quota signals with the newest ObservedAt among
-// the auth-level and per-model snapshots. Quota windows are account-wide, so the
-// most recent observation wins regardless of which model produced it.
-func newestQuotaSignals(auth *Auth) map[string]string {
+// the auth-level and per-model snapshots, along with that ObservedAt. Quota
+// windows are account-wide, so the most recent observation wins regardless of
+// which model produced it.
+func newestQuotaSignals(auth *Auth) (map[string]string, time.Time) {
 	if auth == nil {
-		return nil
+		return nil, time.Time{}
 	}
 	signals := auth.Quota.Signals
 	observedAt := auth.Quota.ObservedAt
@@ -103,7 +121,7 @@ func newestQuotaSignals(auth *Auth) map[string]string {
 			observedAt = state.Quota.ObservedAt
 		}
 	}
-	return signals
+	return signals, observedAt
 }
 
 func quotaSignal(signals map[string]string, key string) string {
