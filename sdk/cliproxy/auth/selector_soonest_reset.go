@@ -57,10 +57,9 @@ func longWindowResetAt(auth *Auth, now time.Time) (time.Time, bool) {
 		return time.Time{}, false
 	}
 
+	// Only the 7d header is used for Claude: the generic unified reset can
+	// describe the 5-hour window.
 	reset, ok := parseResetUnix(quotaSignal(signals, "Anthropic-Ratelimit-Unified-7d-Reset"))
-	if !ok {
-		reset, ok = parseResetUnix(quotaSignal(signals, "Anthropic-Ratelimit-Unified-Reset"))
-	}
 	if !ok {
 		reset, ok = codexLongWindowResetAt(signals)
 	}
@@ -70,17 +69,17 @@ func longWindowResetAt(auth *Auth, now time.Time) (time.Time, bool) {
 	return reset, true
 }
 
-// codexLongWindowResetAt prefers the Codex window with the larger positive
-// length; without window lengths it uses the primary window.
+// codexLongWindowResetAt uses the reset of the Codex slot with the larger
+// positive window length; that slot's reset is unknown when missing, with no
+// fallback to the shorter window. Without window lengths it uses the primary
+// reset.
 func codexLongWindowResetAt(signals map[string]string) (time.Time, bool) {
-	primary, primaryOK := parseResetUnix(quotaSignal(signals, "X-Codex-Primary-Reset-At"))
-	secondary, secondaryOK := parseResetUnix(quotaSignal(signals, "X-Codex-Secondary-Reset-At"))
 	primaryMinutes, _ := strconv.ParseInt(quotaSignal(signals, "X-Codex-Primary-Window-Minutes"), 10, 64)
 	secondaryMinutes, _ := strconv.ParseInt(quotaSignal(signals, "X-Codex-Secondary-Window-Minutes"), 10, 64)
-	if secondaryOK && (!primaryOK || (secondaryMinutes > 0 && secondaryMinutes > primaryMinutes)) {
-		return secondary, true
+	if secondaryMinutes > 0 && secondaryMinutes > primaryMinutes {
+		return parseResetUnix(quotaSignal(signals, "X-Codex-Secondary-Reset-At"))
 	}
-	return primary, primaryOK
+	return parseResetUnix(quotaSignal(signals, "X-Codex-Primary-Reset-At"))
 }
 
 // newestQuotaSignals returns the quota signals with the newest ObservedAt among

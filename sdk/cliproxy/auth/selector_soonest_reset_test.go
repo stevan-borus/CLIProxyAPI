@@ -50,23 +50,40 @@ func TestSoonestResetSelectorPick_SoonestWeeklyResetWins(t *testing.T) {
 	}
 }
 
-func TestSoonestResetSelectorPick_CaseInsensitiveAndFallbackResetKey(t *testing.T) {
+func TestSoonestResetSelectorPick_CaseInsensitiveAndUnifiedResetIsUnknown(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
 	later := claudeQuotaAuth("a", now.Add(5*24*time.Hour), now)
-	fallback := &Auth{
+	lowerCase := &Auth{
 		ID: "b",
 		Quota: QuotaState{
 			ObservedAt: now,
 			Signals: map[string]string{
-				"anthropic-ratelimit-unified-reset": soonestResetUnix(now.Add(24 * time.Hour)),
+				"anthropic-ratelimit-unified-7d-reset": soonestResetUnix(now.Add(24 * time.Hour)),
 			},
 		},
 	}
 
-	if got := pickSoonestReset(t, "claude", "", later, fallback); got.ID != "b" {
+	if got := pickSoonestReset(t, "claude", "", later, lowerCase); got.ID != "b" {
 		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "b")
+	}
+
+	// The generic unified reset may describe the 5-hour window, so a credential
+	// carrying only that header has an unknown weekly reset and goes after a
+	// known 7d reset even though its value is earlier.
+	unifiedOnly := &Auth{
+		ID: "0",
+		Quota: QuotaState{
+			ObservedAt: now,
+			Signals: map[string]string{
+				"Anthropic-Ratelimit-Unified-Reset": soonestResetUnix(now.Add(time.Hour)),
+			},
+		},
+	}
+
+	if got := pickSoonestReset(t, "claude", "", later, unifiedOnly); got.ID != "a" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "a")
 	}
 }
 
@@ -223,5 +240,107 @@ func TestSoonestResetSelectorPick_HigherPriorityWins(t *testing.T) {
 
 	if got := pickSoonestReset(t, "claude", "", lowSoon, highLate); got.ID != "b" {
 		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "b")
+	}
+}
+
+func codexQuotaAuth(id string, signals map[string]string, observedAt time.Time) *Auth {
+	return &Auth{ID: id, Quota: QuotaState{ObservedAt: observedAt, Signals: signals}}
+}
+
+func TestSoonestResetSelectorPick_CodexWeeklySlotResetUsed(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	// The weekly window sits in the primary slot; the short secondary window
+	// resets much sooner but must not decide.
+	weekly := codexQuotaAuth("0", map[string]string{
+		"X-Codex-Primary-Reset-At":         soonestResetUnix(now.Add(4 * 24 * time.Hour)),
+		"X-Codex-Primary-Window-Minutes":   "10080",
+		"X-Codex-Secondary-Reset-At":       soonestResetUnix(now.Add(time.Hour)),
+		"X-Codex-Secondary-Window-Minutes": "300",
+	}, now)
+	sooner := claudeQuotaAuth("a", now.Add(2*24*time.Hour), now)
+	later := claudeQuotaAuth("b", now.Add(6*24*time.Hour), now)
+
+	if got := pickSoonestReset(t, "codex", "", weekly, sooner); got.ID != "a" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "a")
+	}
+	if got := pickSoonestReset(t, "codex", "", weekly, later); got.ID != "0" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "0")
+	}
+}
+
+func TestSoonestResetSelectorPick_CodexWeeklySlotMissingResetIsUnknown(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	known := claudeQuotaAuth("z", now.Add(6*24*time.Hour), now)
+	// Weekly window in the secondary slot without a reset; the short primary
+	// window's earlier reset must not stand in for it.
+	weeklySecondary := codexQuotaAuth("a", map[string]string{
+		"X-Codex-Primary-Reset-At":         soonestResetUnix(now.Add(time.Hour)),
+		"X-Codex-Primary-Window-Minutes":   "300",
+		"X-Codex-Secondary-Window-Minutes": "10080",
+	}, now)
+	// Weekly window in the primary slot without a reset; the short secondary
+	// window's earlier reset must not stand in for it.
+	weeklyPrimary := codexQuotaAuth("b", map[string]string{
+		"X-Codex-Primary-Window-Minutes":   "10080",
+		"X-Codex-Secondary-Reset-At":       soonestResetUnix(now.Add(time.Hour)),
+		"X-Codex-Secondary-Window-Minutes": "300",
+	}, now)
+
+	if got := pickSoonestReset(t, "codex", "", weeklySecondary, known); got.ID != "z" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "z")
+	}
+	if got := pickSoonestReset(t, "codex", "", weeklyPrimary, known); got.ID != "z" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "z")
+	}
+}
+
+func TestSoonestResetSelectorPick_CodexNoWindowMinutesUsesPrimaryReset(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	noMinutes := codexQuotaAuth("0", map[string]string{
+		"X-Codex-Primary-Reset-At":   soonestResetUnix(now.Add(2 * 24 * time.Hour)),
+		"X-Codex-Secondary-Reset-At": soonestResetUnix(now.Add(time.Hour)),
+	}, now)
+	secondaryOnly := codexQuotaAuth("1", map[string]string{
+		"X-Codex-Secondary-Reset-At": soonestResetUnix(now.Add(time.Hour)),
+	}, now)
+	sooner := claudeQuotaAuth("a", now.Add(24*time.Hour), now)
+	later := claudeQuotaAuth("b", now.Add(3*24*time.Hour), now)
+
+	// The primary reset (2d) decides, not the earlier secondary (1h).
+	if got := pickSoonestReset(t, "codex", "", noMinutes, later); got.ID != "0" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "0")
+	}
+	if got := pickSoonestReset(t, "codex", "", noMinutes, sooner); got.ID != "a" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "a")
+	}
+	// Without window minutes a missing primary reset is unknown.
+	if got := pickSoonestReset(t, "codex", "", secondaryOnly, later); got.ID != "b" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "b")
+	}
+}
+
+type soonestResetTestCustomSelector struct{}
+
+func (soonestResetTestCustomSelector) Pick(context.Context, string, string, cliproxyexecutor.Options, []*Auth) (*Auth, error) {
+	return nil, nil
+}
+
+func TestSelectorContextForAvailableAuths_SoonestResetIsPrevalidated(t *testing.T) {
+	t.Parallel()
+
+	ctx := selectorContextForAvailableAuths(context.Background(), &SoonestResetSelector{}, "route-model")
+	if validated, _ := ctx.Value(prevalidatedAuthCandidatesKey{}).(bool); !validated {
+		t.Fatalf("SoonestResetSelector context prevalidated = false, want true")
+	}
+
+	ctx = selectorContextForAvailableAuths(context.Background(), soonestResetTestCustomSelector{}, "route-model")
+	if validated, _ := ctx.Value(prevalidatedAuthCandidatesKey{}).(bool); validated {
+		t.Fatalf("custom selector context prevalidated = true, want false")
 	}
 }
